@@ -89,35 +89,40 @@ async fn handle_socket(socket: WebSocket, service: Arc<WebSocketService>) {
     let client_id = Uuid::new_v4();
     let (tx, mut rx) = mpsc::unbounded_channel();
 
-    service.add_connection(client_id, tx).await;
+    service.add_connection(client_id, tx.clone()).await;
 
     let (mut sender, mut receiver) = socket.split();
 
-    let mut send_task = tokio::spawn(async move {
+    let service_send = service.clone();
+    let client_id_send = client_id;
+
+    let send_task = tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
             if sender.send(msg).await.is_err() {
                 break;
             }
         }
+        service_send.remove_connection(&client_id_send).await;
     });
 
-    let service_clone = service.clone();
-    let client_id_clone = client_id;
+    let service_recv = service.clone();
+    let client_id_recv = client_id;
+    let pong_tx = tx.clone();
 
-    let mut recv_task = tokio::spawn(async move {
+    let recv_task = tokio::spawn(async move {
         while let Some(Ok(msg)) = receiver.next().await {
             match msg {
                 Message::Text(text) => {
-                    tracing::debug!("Received text message from {}: {}", client_id_clone, text);
+                    tracing::debug!("Received text message from {}: {}", client_id_recv, text);
                 }
                 Message::Binary(data) => {
-                    tracing::debug!("Received binary message from {}: {} bytes", client_id_clone, data.len());
+                    tracing::debug!("Received binary message from {}: {} bytes", client_id_recv, data.len());
                 }
                 Message::Close(_) => {
                     break;
                 }
                 Message::Ping(data) => {
-                    if let Err(e) = sender.send(Message::Pong(data)).await {
+                    if let Err(e) = pong_tx.send(Message::Pong(data)) {
                         tracing::error!("Failed to send pong: {}", e);
                         break;
                     }
@@ -125,7 +130,7 @@ async fn handle_socket(socket: WebSocket, service: Arc<WebSocketService>) {
                 Message::Pong(_) => {}
             }
         }
-        service_clone.remove_connection(&client_id_clone).await;
+        service_recv.remove_connection(&client_id_recv).await;
     });
 
     tokio::select! {
@@ -133,7 +138,6 @@ async fn handle_socket(socket: WebSocket, service: Arc<WebSocketService>) {
             recv_task.abort();
         }
         _ = recv_task => {
-            send_task.abort();
         }
     }
 }

@@ -3,11 +3,13 @@ mod discovery;
 mod peer;
 mod transfer;
 mod utils;
+mod websocket;
 
 use anyhow::Result;
 use config::AppConfig;
 use discovery::DiscoveryService;
 use transfer::TransferService;
+use websocket::WebSocketService;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -39,9 +41,21 @@ async fn main() -> Result<()> {
         }
     });
 
+    let websocket_service = Arc::new(WebSocketService::new(
+        config.clone(),
+        peers.clone(),
+    ));
+
+    let websocket_task = tokio::spawn(async move {
+        if let Err(e) = websocket_service.start_server().await {
+            tracing::error!("WebSocket server error: {}", e);
+        }
+    });
+
     tokio::select! {
         _ = transfer_task => {},
         _ = discovery_task => {},
+        _ = websocket_task => {},
     }
 
     Ok(())
