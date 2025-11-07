@@ -12,6 +12,10 @@ pub enum ClientMessage {
         file_path: String,
     },
     GetLocalInfo,
+    SendChat {
+        peer_id: Option<Uuid>,
+        message: String,
+    },
     Ping,
 }
 
@@ -48,6 +52,13 @@ pub enum ServerMessage {
     FileTransferError {
         transfer_id: Uuid,
         message: String,
+    },
+    ChatMessage {
+        from_peer_id: Uuid,
+        from_hostname: String,
+        to_peer_id: Option<Uuid>,
+        message: String,
+        timestamp: u64,
     },
     Pong,
     Error {

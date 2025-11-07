@@ -20,6 +20,7 @@ pub struct WebSocketService {
     config: Arc<AppConfig>,
     peers: Arc<RwLock<PeerManager>>,
     connections: Arc<RwLock<HashMap<Uuid, mpsc::UnboundedSender<Message>>>>,
+    client_to_peer: Arc<RwLock<HashMap<Uuid, Uuid>>>,
     transfer_service: Arc<TransferService>,
 }
 
@@ -33,6 +34,7 @@ impl WebSocketService {
             config,
             peers,
             connections: Arc::new(RwLock::new(HashMap::new())),
+            client_to_peer: Arc::new(RwLock::new(HashMap::new())),
             transfer_service,
         }
     }
@@ -55,15 +57,19 @@ impl WebSocketService {
         Ok(())
     }
 
-    pub async fn add_connection(&self, client_id: Uuid, tx: mpsc::UnboundedSender<Message>) {
+    pub async fn add_connection(&self, client_id: Uuid, peer_id: Uuid, tx: mpsc::UnboundedSender<Message>) {
         let mut connections = self.connections.write().await;
         connections.insert(client_id, tx);
-        tracing::info!("WebSocket client connected: {}", client_id);
+        let mut client_to_peer = self.client_to_peer.write().await;
+        client_to_peer.insert(client_id, peer_id);
+        tracing::info!("WebSocket client connected: {} (peer: {})", client_id, peer_id);
     }
 
     pub async fn remove_connection(&self, client_id: &Uuid) {
         let mut connections = self.connections.write().await;
         connections.remove(client_id);
+        let mut client_to_peer = self.client_to_peer.write().await;
+        client_to_peer.remove(client_id);
         tracing::info!("WebSocket client disconnected: {}", client_id);
     }
 
@@ -129,6 +135,47 @@ impl WebSocketService {
                     }))
                 }
             }
+            ClientMessage::SendChat { peer_id, message } => {
+                let peers = self.peers.read().await;
+                let client_to_peer = self.client_to_peer.read().await;
+                let from_peer_id = client_to_peer.get(&client_id)
+                    .copied()
+                    .unwrap_or_else(|| peers.local_id());
+                let from_hostname = peers.local_hostname().to_string();
+
+                let timestamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+
+                let chat_msg = ServerMessage::ChatMessage {
+                    from_peer_id,
+                    from_hostname,
+                    to_peer_id: peer_id,
+                    message,
+                    timestamp,
+                };
+
+                let json = serde_json::to_string(&chat_msg).unwrap_or_default();
+                let ws_msg = axum::extract::ws::Message::Text(json.clone());
+
+                if let Some(target_peer_id) = peer_id {
+                    let connections = self.connections.read().await;
+                    let client_to_peer = self.client_to_peer.read().await;
+                    
+                    for (cid, peer_id_map) in client_to_peer.iter() {
+                        if *peer_id_map == target_peer_id || *cid == client_id {
+                            if let Some(tx) = connections.get(cid) {
+                                let _ = tx.send(ws_msg.clone());
+                            }
+                        }
+                    }
+                } else {
+                    self.broadcast_to_all(ws_msg).await;
+                }
+
+                Ok(None)
+            }
             ClientMessage::Ping => Ok(Some(ServerMessage::Pong)),
         }
     }
@@ -157,7 +204,12 @@ async fn handle_socket(socket: WebSocket, service: Arc<WebSocketService>) {
     let client_id = Uuid::new_v4();
     let (tx, mut rx) = mpsc::unbounded_channel();
 
-    service.add_connection(client_id, tx.clone()).await;
+    let peer_id = {
+        let peers = service.peers.read().await;
+        peers.local_id()
+    };
+
+    service.add_connection(client_id, peer_id, tx.clone()).await;
 
     let (mut sender, mut receiver) = socket.split();
 
