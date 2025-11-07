@@ -1,0 +1,12 @@
+[network]
+discovery_port = 7878   
+transfer_port = 7879      
+web_port = 3030           
+broadcast_interval = 2    
+
+[transfer]
+chunk_size = 65536        
+max_concurrent = 5        
+
+[ui]
+theme = "dark"            
