@@ -1,6 +1,7 @@
 mod config;
 mod discovery;
 mod peer;
+mod protocol;
 mod transfer;
 mod utils;
 mod websocket;
@@ -22,10 +23,11 @@ async fn main() -> Result<()> {
 
     let peers = Arc::new(RwLock::new(peer::PeerManager::new()));
 
-    let transfer_service = TransferService::new(config.clone());
+    let transfer_service = Arc::new(TransferService::new(config.clone()));
+    let transfer_service_listener = transfer_service.clone();
     
     let transfer_task = tokio::spawn(async move {
-        if let Err(e) = transfer_service.start_listener().await {
+        if let Err(e) = transfer_service_listener.start_listener().await {
             tracing::error!("Transfer listener error: {}", e);
         }
     });
@@ -44,6 +46,7 @@ async fn main() -> Result<()> {
     let websocket_service = Arc::new(WebSocketService::new(
         config.clone(),
         peers.clone(),
+        transfer_service.clone(),
     ));
 
     let websocket_task = tokio::spawn(async move {

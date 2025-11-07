@@ -1,5 +1,7 @@
 use crate::config::AppConfig;
 use crate::peer::PeerManager;
+use crate::protocol::{ClientMessage, ServerMessage, PeerInfo};
+use crate::transfer::TransferService;
 use anyhow::Result;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
@@ -9,6 +11,7 @@ use axum::Router;
 use futures_util::{SinkExt, StreamExt};
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
 use uuid::Uuid;
@@ -17,14 +20,20 @@ pub struct WebSocketService {
     config: Arc<AppConfig>,
     peers: Arc<RwLock<PeerManager>>,
     connections: Arc<RwLock<HashMap<Uuid, mpsc::UnboundedSender<Message>>>>,
+    transfer_service: Arc<TransferService>,
 }
 
 impl WebSocketService {
-    pub fn new(config: Arc<AppConfig>, peers: Arc<RwLock<PeerManager>>) -> Self {
+    pub fn new(
+        config: Arc<AppConfig>,
+        peers: Arc<RwLock<PeerManager>>,
+        transfer_service: Arc<TransferService>,
+    ) -> Self {
         Self {
             config,
             peers,
             connections: Arc::new(RwLock::new(HashMap::new())),
+            transfer_service,
         }
     }
 
@@ -76,6 +85,65 @@ impl WebSocketService {
             Err(anyhow::anyhow!("Client not found"))
         }
     }
+
+    async fn handle_client_message(
+        &self,
+        client_id: Uuid,
+        message: ClientMessage,
+    ) -> Result<Option<ServerMessage>> {
+        match message {
+            ClientMessage::GetPeers => {
+                let peers = self.peers.read().await;
+                let peer_list: Vec<PeerInfo> = peers
+                    .list_peers()
+                    .into_iter()
+                    .map(PeerInfo::from)
+                    .collect();
+                Ok(Some(ServerMessage::PeersList { peers: peer_list }))
+            }
+            ClientMessage::GetLocalInfo => {
+                let peers = self.peers.read().await;
+                Ok(Some(ServerMessage::LocalInfo {
+                    peer_id: peers.local_id(),
+                    hostname: peers.local_hostname().to_string(),
+                }))
+            }
+            ClientMessage::SendFile { peer_id, file_path } => {
+                let peers = self.peers.read().await;
+                if let Some(peer) = peers.get_peer(&peer_id) {
+                    let file_path = PathBuf::from(file_path);
+                    if file_path.exists() {
+                        let transfer_id = self
+                            .transfer_service
+                            .send_file(peer.address, file_path)
+                            .await?;
+                        Ok(Some(ServerMessage::FileTransferComplete { transfer_id }))
+                    } else {
+                        Ok(Some(ServerMessage::Error {
+                            message: "File not found".to_string(),
+                        }))
+                    }
+                } else {
+                    Ok(Some(ServerMessage::Error {
+                        message: "Peer not found".to_string(),
+                    }))
+                }
+            }
+            ClientMessage::Ping => Ok(Some(ServerMessage::Pong)),
+        }
+    }
+
+    pub async fn notify_peer_discovered(&self, peer: PeerInfo) {
+        let message = ServerMessage::PeerDiscovered { peer };
+        let json = serde_json::to_string(&message).unwrap_or_default();
+        self.broadcast_to_all(Message::Text(json)).await;
+    }
+
+    pub async fn notify_peer_removed(&self, peer_id: Uuid) {
+        let message = ServerMessage::PeerRemoved { peer_id };
+        let json = serde_json::to_string(&message).unwrap_or_default();
+        self.broadcast_to_all(Message::Text(json)).await;
+    }
 }
 
 async fn websocket_handler(
@@ -113,7 +181,28 @@ async fn handle_socket(socket: WebSocket, service: Arc<WebSocketService>) {
         while let Some(Ok(msg)) = receiver.next().await {
             match msg {
                 Message::Text(text) => {
-                    tracing::debug!("Received text message from {}: {}", client_id_recv, text);
+                    if let Ok(client_msg) = serde_json::from_str::<ClientMessage>(&text) {
+                        match service_recv.handle_client_message(client_id_recv, client_msg).await {
+                            Ok(Some(response)) => {
+                                if let Ok(json) = serde_json::to_string(&response) {
+                                    if let Err(e) = pong_tx.send(Message::Text(json)) {
+                                        tracing::error!("Failed to send response: {}", e);
+                                    }
+                                }
+                            }
+                            Ok(None) => {}
+                            Err(e) => {
+                                let error_msg = ServerMessage::Error {
+                                    message: e.to_string(),
+                                };
+                                if let Ok(json) = serde_json::to_string(&error_msg) {
+                                    let _ = pong_tx.send(Message::Text(json));
+                                }
+                            }
+                        }
+                    } else {
+                        tracing::warn!("Invalid message format from {}: {}", client_id_recv, text);
+                    }
                 }
                 Message::Binary(data) => {
                     tracing::debug!("Received binary message from {}: {} bytes", client_id_recv, data.len());
