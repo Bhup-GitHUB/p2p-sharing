@@ -1,0 +1,17 @@
+target/
+Cargo.lock
+
+*.pdb
+*.exe
+*.dll
+
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+.DS_Store
+Thumbs.db
+
+*.log
