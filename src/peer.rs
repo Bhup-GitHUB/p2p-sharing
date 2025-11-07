@@ -23,6 +23,15 @@ impl Peer {
         }
     }
 
+    pub fn from_discovery(id: Uuid, address: SocketAddr, hostname: String) -> Self {
+        Self {
+            id,
+            address,
+            hostname,
+            last_seen: std::time::SystemTime::now(),
+        }
+    }
+
     pub fn update_seen(&mut self) {
         self.last_seen = std::time::SystemTime::now();
     }
@@ -58,7 +67,13 @@ impl PeerManager {
 
     pub fn add_or_update_peer(&mut self, peer: Peer) {
         if peer.id != self.local_id {
-            self.peers.insert(peer.id, peer);
+            if let Some(existing) = self.peers.get_mut(&peer.id) {
+                existing.address = peer.address;
+                existing.hostname = peer.hostname;
+                existing.update_seen();
+            } else {
+                self.peers.insert(peer.id, peer);
+            }
         }
     }
 

@@ -1,6 +1,7 @@
 mod config;
 mod discovery;
 mod peer;
+mod utils;
 
 use anyhow::Result;
 use config::AppConfig;
@@ -17,10 +18,10 @@ async fn main() -> Result<()> {
 
     let peers = Arc::new(RwLock::new(peer::PeerManager::new()));
 
-    let discovery = DiscoveryService::new(
+    let mut discovery = DiscoveryService::new(
         config.clone(),
         peers.clone(),
-    )?;
+    ).await?;
 
     discovery.start().await?;
 
