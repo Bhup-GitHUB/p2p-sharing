@@ -11,6 +11,9 @@ pub enum ClientMessage {
         peer_id: Uuid,
         file_path: String,
     },
+    BroadcastFile {
+        file_path: String,
+    },
     GetLocalInfo,
     SendChat {
         peer_id: Option<Uuid>,
@@ -48,10 +51,28 @@ pub enum ServerMessage {
     },
     FileTransferComplete {
         transfer_id: Uuid,
+        peer_id: Option<Uuid>,
     },
     FileTransferError {
         transfer_id: Uuid,
+        peer_id: Option<Uuid>,
         message: String,
+    },
+    BroadcastTransferStart {
+        transfer_id: Uuid,
+        filename: String,
+        file_size: u64,
+        total_peers: usize,
+    },
+    BroadcastTransferProgress {
+        transfer_id: Uuid,
+        completed_peers: usize,
+        total_peers: usize,
+    },
+    BroadcastTransferComplete {
+        transfer_id: Uuid,
+        successful_peers: usize,
+        failed_peers: usize,
     },
     ChatMessage {
         from_peer_id: Uuid,

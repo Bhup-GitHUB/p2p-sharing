@@ -93,7 +93,7 @@ impl WebSocketService {
     }
 
     async fn handle_client_message(
-        &self,
+        self: Arc<Self>,
         client_id: Uuid,
         message: ClientMessage,
     ) -> Result<Option<ServerMessage>> {
@@ -123,7 +123,10 @@ impl WebSocketService {
                             .transfer_service
                             .send_file(peer.address, file_path)
                             .await?;
-                        Ok(Some(ServerMessage::FileTransferComplete { transfer_id }))
+                        Ok(Some(ServerMessage::FileTransferComplete { 
+                            transfer_id,
+                            peer_id: Some(peer_id),
+                        }))
                     } else {
                         Ok(Some(ServerMessage::Error {
                             message: "File not found".to_string(),
@@ -134,6 +137,105 @@ impl WebSocketService {
                         message: "Peer not found".to_string(),
                     }))
                 }
+            }
+            ClientMessage::BroadcastFile { file_path } => {
+                let peers = self.peers.read().await;
+                let peer_list = peers.list_peers();
+                let file_path = PathBuf::from(file_path);
+                
+                if !file_path.exists() {
+                    return Ok(Some(ServerMessage::Error {
+                        message: "File not found".to_string(),
+                    }));
+                }
+
+                let file_metadata = std::fs::metadata(&file_path)?;
+                let filename = file_path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("unknown")
+                    .to_string();
+                let file_size = file_metadata.len();
+
+                let broadcast_id = Uuid::new_v4();
+                let total_peers = peer_list.len();
+
+                if total_peers == 0 {
+                    return Ok(Some(ServerMessage::Error {
+                        message: "No peers available for broadcast".to_string(),
+                    }));
+                }
+
+                let start_msg = ServerMessage::BroadcastTransferStart {
+                    transfer_id: broadcast_id,
+                    filename: filename.clone(),
+                    file_size,
+                    total_peers,
+                };
+                let json = serde_json::to_string(&start_msg).unwrap_or_default();
+                let ws_msg = axum::extract::ws::Message::Text(json);
+                self.send_to_client(&client_id, ws_msg).await?;
+
+                let transfer_service = self.transfer_service.clone();
+                let websocket_service = self.clone();
+                let client_id_clone = client_id;
+
+                tokio::spawn(async move {
+                    let mut successful = 0;
+                    let mut failed = 0;
+                    let mut completed = 0;
+
+                    for peer in peer_list {
+                        let result = transfer_service
+                            .send_file(peer.address, file_path.clone())
+                            .await;
+
+                        completed += 1;
+
+                        match result {
+                            Ok(_) => {
+                                successful += 1;
+                            }
+                            Err(e) => {
+                                failed += 1;
+                                let error_msg = ServerMessage::FileTransferError {
+                                    transfer_id: broadcast_id,
+                                    peer_id: Some(peer.id),
+                                    message: e.to_string(),
+                                };
+                                let json = serde_json::to_string(&error_msg).unwrap_or_default();
+                                let _ = websocket_service.send_to_client(
+                                    &client_id_clone,
+                                    axum::extract::ws::Message::Text(json),
+                                ).await;
+                            }
+                        }
+
+                        let progress_msg = ServerMessage::BroadcastTransferProgress {
+                            transfer_id: broadcast_id,
+                            completed_peers: completed,
+                            total_peers,
+                        };
+                        let json = serde_json::to_string(&progress_msg).unwrap_or_default();
+                        let _ = websocket_service.send_to_client(
+                            &client_id_clone,
+                            axum::extract::ws::Message::Text(json),
+                        ).await;
+                    }
+
+                    let complete_msg = ServerMessage::BroadcastTransferComplete {
+                        transfer_id: broadcast_id,
+                        successful_peers: successful,
+                        failed_peers: failed,
+                    };
+                    let json = serde_json::to_string(&complete_msg).unwrap_or_default();
+                    let _ = websocket_service.send_to_client(
+                        &client_id_clone,
+                        axum::extract::ws::Message::Text(json),
+                    ).await;
+                });
+
+                Ok(None)
             }
             ClientMessage::SendChat { peer_id, message } => {
                 let peers = self.peers.read().await;
@@ -234,7 +336,7 @@ async fn handle_socket(socket: WebSocket, service: Arc<WebSocketService>) {
             match msg {
                 Message::Text(text) => {
                     if let Ok(client_msg) = serde_json::from_str::<ClientMessage>(&text) {
-                        match service_recv.handle_client_message(client_id_recv, client_msg).await {
+                        match service_recv.clone().handle_client_message(client_id_recv, client_msg).await {
                             Ok(Some(response)) => {
                                 if let Ok(json) = serde_json::to_string(&response) {
                                     if let Err(e) = pong_tx.send(Message::Text(json)) {

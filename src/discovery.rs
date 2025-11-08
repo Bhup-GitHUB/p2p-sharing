@@ -1,5 +1,6 @@
 use crate::config::AppConfig;
 use crate::peer::{Peer, PeerManager};
+use crate::protocol::PeerInfo;
 use crate::utils;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -20,6 +21,7 @@ pub struct DiscoveryService {
     config: Arc<AppConfig>,
     peers: Arc<RwLock<PeerManager>>,
     socket: UdpSocket,
+    websocket_service: Option<Arc<crate::websocket::WebSocketService>>,
 }
 
 impl DiscoveryService {
@@ -32,13 +34,19 @@ impl DiscoveryService {
             config,
             peers,
             socket,
+            websocket_service: None,
         })
+    }
+
+    pub fn set_websocket_service(&mut self, service: Arc<crate::websocket::WebSocketService>) {
+        self.websocket_service = Some(service);
     }
 
     pub async fn start(&mut self) -> Result<()> {
         let socket = Arc::new(self.socket.try_clone()?);
         let config = self.config.clone();
         let peers = self.peers.clone();
+        let websocket = self.websocket_service.clone();
 
         let broadcast_task = {
             let socket = socket.clone();
@@ -52,15 +60,17 @@ impl DiscoveryService {
         let listen_task = {
             let socket = socket.clone();
             let peers = peers.clone();
+            let websocket = websocket.clone();
             tokio::spawn(async move {
-                Self::listen_loop(socket, peers).await;
+                Self::listen_loop(socket, peers, websocket).await;
             })
         };
 
         let cleanup_task = {
             let peers = peers.clone();
+            let websocket = websocket.clone();
             tokio::spawn(async move {
-                Self::cleanup_loop(peers).await;
+                Self::cleanup_loop(peers, websocket).await;
             })
         };
 
@@ -100,7 +110,11 @@ impl DiscoveryService {
         }
     }
 
-    async fn listen_loop(socket: Arc<UdpSocket>, peers: Arc<RwLock<PeerManager>>) {
+    async fn listen_loop(
+        socket: Arc<UdpSocket>,
+        peers: Arc<RwLock<PeerManager>>,
+        websocket: Option<Arc<crate::websocket::WebSocketService>>,
+    ) {
         let mut buf = [0u8; 1024];
 
         loop {
@@ -109,9 +123,21 @@ impl DiscoveryService {
                     if let Ok(message) = serde_json::from_slice::<DiscoveryMessage>(&buf[..size]) {
                         let mut peer_manager = peers.write().await;
                         if message.peer_id != peer_manager.local_id() {
-                            let peer = Peer::from_discovery(message.peer_id, message.address, message.hostname);
+                            let was_new = !peer_manager.get_peer(&message.peer_id).is_some();
+                            let peer = Peer::from_discovery(message.peer_id, message.address, message.hostname.clone());
                             peer_manager.add_or_update_peer(peer);
                             tracing::info!("Discovered peer: {} from {}", message.hostname, addr);
+                            
+                            if was_new {
+                                if let Some(ws) = &websocket {
+                                    let peer_info = PeerInfo {
+                                        id: message.peer_id,
+                                        address: message.address,
+                                        hostname: message.hostname,
+                                    };
+                                    ws.notify_peer_discovered(peer_info).await;
+                                }
+                            }
                         }
                     }
                 }
@@ -122,13 +148,32 @@ impl DiscoveryService {
         }
     }
 
-    async fn cleanup_loop(peers: Arc<RwLock<PeerManager>>) {
+    async fn cleanup_loop(
+        peers: Arc<RwLock<PeerManager>>,
+        websocket: Option<Arc<crate::websocket::WebSocketService>>,
+    ) {
         let mut interval = interval(Duration::from_secs(10));
 
         loop {
             interval.tick().await;
             let mut peer_manager = peers.write().await;
+            let before_peers: std::collections::HashSet<_> = peer_manager.list_peers()
+                .iter()
+                .map(|p| p.id)
+                .collect();
+            
             peer_manager.cleanup_stale_peers(30);
+            
+            let after_peers: std::collections::HashSet<_> = peer_manager.list_peers()
+                .iter()
+                .map(|p| p.id)
+                .collect();
+
+            if let Some(ws) = &websocket {
+                for removed_id in before_peers.difference(&after_peers) {
+                    ws.notify_peer_removed(*removed_id).await;
+                }
+            }
         }
     }
 }
