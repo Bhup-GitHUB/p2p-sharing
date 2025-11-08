@@ -1,5 +1,6 @@
 mod config;
 mod discovery;
+mod history;
 mod peer;
 mod protocol;
 mod transfer;

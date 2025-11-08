@@ -1,7 +1,9 @@
 use crate::config::AppConfig;
+use crate::history::TransferHistory;
 use crate::peer::PeerManager;
 use crate::protocol::{ClientMessage, ServerMessage, PeerInfo};
 use crate::transfer::TransferService;
+use crate::utils;
 use anyhow::Result;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
@@ -22,6 +24,7 @@ pub struct WebSocketService {
     connections: Arc<RwLock<HashMap<Uuid, mpsc::UnboundedSender<Message>>>>,
     client_to_peer: Arc<RwLock<HashMap<Uuid, Uuid>>>,
     transfer_service: Arc<TransferService>,
+    history: Arc<TransferHistory>,
 }
 
 impl WebSocketService {
@@ -36,6 +39,7 @@ impl WebSocketService {
             connections: Arc::new(RwLock::new(HashMap::new())),
             client_to_peer: Arc::new(RwLock::new(HashMap::new())),
             transfer_service,
+            history: Arc::new(TransferHistory::new(1000)), // Keep last 1000 transfers
         }
     }
 
@@ -117,19 +121,67 @@ impl WebSocketService {
             ClientMessage::SendFile { peer_id, file_path } => {
                 let peers = self.peers.read().await;
                 if let Some(peer) = peers.get_peer(&peer_id) {
-                    let file_path = PathBuf::from(file_path);
-                    if file_path.exists() {
-                        let transfer_id = self
-                            .transfer_service
-                            .send_file(peer.address, file_path)
-                            .await?;
-                        Ok(Some(ServerMessage::FileTransferComplete { 
+                    let file_path = PathBuf::from(&file_path);
+                    if file_path.exists() && file_path.is_file() {
+                        let filename = file_path
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("unknown")
+                            .to_string();
+                        let file_size = std::fs::metadata(&file_path)?.len();
+                        
+                        // Create history record
+                        let transfer_id = Uuid::new_v4();
+                        let history_record = crate::history::TransferRecord::new(
                             transfer_id,
-                            peer_id: Some(peer_id),
+                            Some(peer_id),
+                            peer.hostname.clone(),
+                            filename.clone(),
+                            file_path.to_string_lossy().to_string(),
+                            file_size,
+                            "sent".to_string(),
+                        );
+                        self.history.start_transfer(history_record).await;
+                        
+                        let transfer_service = self.transfer_service.clone();
+                        let history = self.history.clone();
+                        let websocket_service = self.clone();
+                        let client_id_clone = client_id;
+                        
+                        tokio::spawn(async move {
+                            match transfer_service.send_file(peer.address, file_path).await {
+                                Ok(_) => {
+                                    // Note: checksum verification would be done in transfer service
+                                    history.complete_transfer(&transfer_id, None, true).await;
+                                }
+                                Err(e) => {
+                                    history.fail_transfer(&transfer_id).await;
+                                    let error_msg = ServerMessage::FileTransferError {
+                                        transfer_id,
+                                        peer_id: Some(peer_id),
+                                        message: e.to_string(),
+                                    };
+                                    let json = serde_json::to_string(&error_msg).unwrap_or_default();
+                                    let _ = websocket_service.send_to_client(
+                                        &client_id_clone,
+                                        axum::extract::ws::Message::Text(json),
+                                    ).await;
+                                }
+                            }
+                        });
+                        
+                        Ok(Some(ServerMessage::FileTransferRequest {
+                            transfer_id,
+                            peer_id,
+                            filename,
+                            file_path: file_path.to_string_lossy().to_string(),
+                            file_size,
+                            file_checksum: None, // Will be calculated during transfer
+                            mime_type: utils::get_mime_type(&file_path),
                         }))
                     } else {
                         Ok(Some(ServerMessage::Error {
-                            message: "File not found".to_string(),
+                            message: "File not found or is not a file".to_string(),
                         }))
                     }
                 } else {
@@ -166,11 +218,17 @@ impl WebSocketService {
                     }));
                 }
 
+                let file_checksum = utils::calculate_file_checksum(&file_path).await.ok();
+                let mime_type = utils::get_mime_type(&file_path);
+                
                 let start_msg = ServerMessage::BroadcastTransferStart {
                     transfer_id: broadcast_id,
                     filename: filename.clone(),
+                    file_path: file_path.to_string_lossy().to_string(),
                     file_size,
                     total_peers,
+                    file_checksum,
+                    mime_type,
                 };
                 let json = serde_json::to_string(&start_msg).unwrap_or_default();
                 let ws_msg = axum::extract::ws::Message::Text(json);
@@ -277,6 +335,52 @@ impl WebSocketService {
                 }
 
                 Ok(None)
+            }
+            ClientMessage::GetTransferHistory => {
+                let history_entries = self.history.get_all_history().await;
+                Ok(Some(ServerMessage::TransferHistory {
+                    transfers: history_entries,
+                }))
+            }
+            ClientMessage::GetTransferStats { transfer_id } => {
+                if let Some(record) = self.history.get_transfer(&transfer_id).await {
+                    Ok(Some(ServerMessage::TransferStats {
+                        transfer_id,
+                        status: record.status,
+                        progress: 0, // Would need to track this separately
+                        total: record.file_size,
+                        speed_bytes_per_sec: record.speed_bytes_per_sec,
+                        eta_seconds: None, // Would need to calculate
+                        start_time: record.start_time,
+                    }))
+                } else {
+                    Ok(Some(ServerMessage::Error {
+                        message: "Transfer not found".to_string(),
+                    }))
+                }
+            }
+            ClientMessage::CancelTransfer { transfer_id } => {
+                self.history.cancel_transfer(&transfer_id).await;
+                Ok(Some(ServerMessage::TransferCancelled { transfer_id }))
+            }
+            ClientMessage::PauseTransfer { transfer_id } => {
+                self.history.pause_transfer(&transfer_id).await;
+                Ok(Some(ServerMessage::TransferPaused { transfer_id }))
+            }
+            ClientMessage::ResumeTransfer { transfer_id } => {
+                self.history.resume_transfer(&transfer_id).await;
+                Ok(Some(ServerMessage::TransferResumed { transfer_id }))
+            }
+            ClientMessage::SendDirectory { peer_id, dir_path } => {
+                // Directory transfer would require archiving - for now return error
+                Ok(Some(ServerMessage::Error {
+                    message: "Directory transfer not yet implemented. Please archive the directory first.".to_string(),
+                }))
+            }
+            ClientMessage::BroadcastDirectory { dir_path: _ } => {
+                Ok(Some(ServerMessage::Error {
+                    message: "Directory broadcast not yet implemented. Please archive the directory first.".to_string(),
+                }))
             }
             ClientMessage::Ping => Ok(Some(ServerMessage::Pong)),
         }
